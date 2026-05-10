@@ -1,42 +1,32 @@
-
 # Mega AI
 
-Real-Time Multi-Agent LLM Orchestration and Evaluation System
+**Real-Time Multi-Agent LLM Orchestration and Evaluation System**
 
-Mega AI is a containerized, local-first multi-agent orchestration prototype built with FastAPI, PostgreSQL, SQLModel, Server-Sent Events, and Ollama. It demonstrates dynamic LLM-based routing, shared-context agent handoffs, structured tool failure handling, trace logging, context budgeting, and a custom evaluation harness.
+Mega AI is a containerized, local-first multi-agent system built with FastAPI, PostgreSQL, SQLModel, Server-Sent Events, and Ollama. It implements dynamic LLM-based routing, a shared-context inter-agent communication schema, structured tool failure handling, context budget enforcement, and a fully custom evaluation harness with a self-improving prompt loop.
 
-This project was built for the LLM Engineer take-home assessment.
+---
 
-## Features
+## Table of Contents
 
-- Multi-agent orchestration through a master orchestrator
-- SharedContext schema for all inter-agent communication
-- Dynamic LLM-based routing with fallback guards
-- Server-Sent Events streaming via `sse-starlette`
-- PostgreSQL-backed execution traces with SQLModel
-- Retryable tool interfaces with explicit failure contracts
-- Context budget tracking and compression agent
-- Custom 15-case evaluation harness
-- Meta-agent that proposes prompt diffs from failed eval cases
-- Docker Compose setup for API and PostgreSQL
-- Local Ollama integration via HTTP
+- [Architecture](#architecture)
+- [Agents](#agents)
+- [Tools](#tools)
+- [Context Budget Management](#context-budget-management)
+- [Evaluation Pipeline](#evaluation-pipeline)
+- [Self-Improving Prompt Loop](#self-improving-prompt-loop)
+- [Streaming and Observability](#streaming-and-observability)
+- [API Reference](#api-reference)
+- [Setup and Running](#setup-and-running)
+- [Environment Variables](#environment-variables)
+- [Known Limitations](#known-limitations)
+- [What I Would Build Next](#what-i-would-build-next)
+- [AI Collaboration Attestation](#ai-collaboration-attestation)
 
-## Tech Stack
-
-- Python
-- FastAPI
-- SQLModel
-- PostgreSQL
-- Docker Compose
-- Ollama
-- httpx
-- sse-starlette
-- tiktoken
-- uv
+---
 
 ## Architecture
 
-```text
+```
 Client
   |
   | POST /query
@@ -45,204 +35,283 @@ FastAPI SSE Endpoint
   |
   v
 Master Orchestrator
+  |  LLM-based routing decision (structured JSON) per turn
+  |  Every decision logged to SharedContext.history and persisted to PostgreSQL
   |
-  |-- reads/writes SharedContext
-  |-- makes LLM-based routing decisions
-  |-- logs every routing decision and agent output
+  +--> DecompositionAgent      Parses query into typed task DAG with dependency resolution
   |
-  +--> DecompositionAgent
-  |      Creates typed task DAGs for ambiguous or complex queries
+  +--> MultiHopRAGAgent        Two-hop retrieval reasoning with per-chunk citation mapping
   |
-  +--> MultiHopRAGAgent
-  |      Performs multi-hop retrieval-style reasoning and citation mapping
+  +--> CritiqueAgent           Span-level confidence scoring and self-reflection tool call
   |
-  +--> CritiqueAgent
-  |      Scores claims, flags weak spans, and calls self-reflection
+  +--> SynthesisAgent          Merges outputs, resolves contradictions, builds provenance map
   |
-  +--> SynthesisAgent
-  |      Produces final answer and provenance map
-  |
-  +--> CompressionAgent
-         Summarizes conversational history when context budget is exceeded
+  +--> CompressionAgent        Triggered by ContextManager when token budget is exceeded
 
-Tools
+Tools (called by agents via SharedContext, never directly between agents)
   |
-  +--> SearchTool
-  +--> PythonTool
-  +--> SQLTool
-  +--> SelfReflectionTool
+  +--> SearchTool              DuckDuckGo instant-answer stub with structured failure contract
+  +--> PythonTool              Sandboxed Python execution with blocked unsafe operations
+  +--> SQLTool                 Read-only SELECT execution against PostgreSQL
+  +--> SelfReflectionTool      LLM re-reads prior context and surfaces contradictions
 
 Persistence
   |
-  +--> JobExecution table
-  +--> EvaluationRun table
-  +--> PromptVersion table
+  +--> JobExecution            Full trace per job: routing decisions, agent outputs, tool calls, token counts
+  +--> EvaluationRun           Per-case scores and justifications per eval run
+  +--> PromptVersion           Proposed and approved prompt rewrites with approval audit trail
 ```
+
+All inter-agent communication flows exclusively through a typed `SharedContext` object. Agents do not call one another. The orchestrator mediates every handoff and logs its routing rationale before each step.
+
+---
 
 ## Agents
 
 ### Master Orchestrator
 
-The orchestrator owns execution flow. It does not use a fixed hardcoded chain as the primary control path. Instead, it asks the local LLM to choose the next agent using structured JSON routing. If routing fails, returns invalid JSON, or selects an unsafe step, deterministic fallback routing is used.
+The orchestrator owns the full execution loop up to a maximum of 12 turns. At each turn it sends the current `SharedContext` to the local LLM and receives a JSON routing decision specifying the next agent and a justification string. If the model returns malformed JSON or selects an unregistered agent, a deterministic fallback fires: `decomposition_agent` if history is empty, `synthesis_agent` otherwise.
 
-Every routing decision is logged to `JobExecution.trace`.
+Every routing decision — including fallback activations — is appended as an `AgentStep` to `SharedContext.history` and written to `JobExecution.trace` in PostgreSQL before the next agent is invoked. This means the exact decision sequence is always recoverable from the database regardless of whether the job completed successfully.
 
 ### DecompositionAgent
 
-Breaks the user query into a task DAG with dependencies. This is used to clarify ambiguous or multi-step requests before retrieval and synthesis.
+Accepts the raw user query and produces a structured task DAG stored in `SharedContext.tasks`. Each task node carries a type, a description, and a list of dependency task IDs. The orchestrator uses this DAG when ambiguous or multi-step queries arrive, ensuring dependent sub-tasks are not scheduled before their predecessors resolve.
 
 ### MultiHopRAGAgent
 
-Plans at least two retrieval/reasoning hops, calls the search tool, stores tool results in `SharedContext.tool_results`, and generates a candidate answer with citations where available.
-
-If search fails or returns empty results, the agent records structured fallback data instead of pretending retrieval succeeded.
+Plans a minimum of two retrieval hops before forming a candidate answer. On each hop, it calls `SearchTool`, stores the result in `SharedContext.tool_results`, and uses the accumulated evidence for the next reasoning step. The final candidate answer includes a citation list mapping each claim to the specific chunk that contributed it. If search fails at any hop, a structured fallback object is stored rather than silently proceeding as if retrieval succeeded.
 
 ### CritiqueAgent
 
-Reviews candidate outputs, assigns confidence scores, flags risky spans, and calls the self-reflection tool. Critique results are stored in the shared context trace.
+Receives the candidate answer from the RAG agent and reviews it at the span level. It assigns a numeric confidence score to each factual claim and flags specific spans it disagrees with, not the output as a whole. After scoring, it calls `SelfReflectionTool` to cross-check critique results against prior session context. All critique output is stored in `SharedContext.history` for the synthesis agent to consume.
 
 ### SynthesisAgent
 
-Merges previous agent outputs into a final answer and builds a provenance map linking answer content to source agents and citations.
+Reads all prior `AgentStep` entries in `SharedContext.history`, resolves contradictions flagged by the critique agent, and produces the final answer. It also builds `SharedContext.provenance_map`, a dictionary linking each sentence index in the final answer to the source agent and source chunk that produced it. The provenance map is included in the SSE `final` event payload.
 
 ### CompressionAgent
 
-Used by the context manager when history exceeds the token budget. It compresses conversational history while preserving structured tool outputs, citations, and scores losslessly in `SharedContext.tool_results`.
+Invoked by the `ContextManager` when `SharedContext.total_tokens` would exceed `max_budget` after a pending addition. It summarizes conversational history entries (lossy) while leaving all structured fields — `tool_results`, citation lists, confidence scores — untouched (lossless). Compression events are logged to `SharedContext.compression_events`.
+
+---
 
 ## Tools
 
-All tools follow a structured failure contract with a two-retry limit.
+All tools share a base interface with a two-retry limit. Each retry is logged separately with its own input, output, latency, and outcome. An agent that receives a tool result and deems it insufficient can re-call with a modified input; the decision to retry is explicit in agent logic, not embedded in a prompt instruction.
+
+Every tool call is stored with: input payload, output payload, latency in milliseconds, attempt number, whether fallback was used, and whether the calling agent accepted or rejected the result.
 
 ### SearchTool
 
-Attempts web-style lookup through DuckDuckGo's public instant-answer endpoint. Returns structured results with title, URL, and snippet.
+Queries DuckDuckGo's public instant-answer endpoint and returns a list of structured results containing title, URL, and snippet. Failure modes:
 
-Failure modes:
-- timeout
-- empty results
-- network error
-
-Fallback returns a structured object with:
-- query
-- last error
-- attempts
-- fallback message
+| Failure condition | Return value |
+|---|---|
+| Network timeout | `ToolResult(ok=False, error="timeout", fallback_used=True)` |
+| Empty results | `ToolResult(ok=False, error="empty_results", fallback_used=True)` |
+| HTTP error | `ToolResult(ok=False, error="http_{status}", fallback_used=True)` |
 
 ### PythonTool
 
-Runs constrained Python snippets in a restricted namespace. Blocks unsafe operations such as filesystem access, subprocess usage, sockets, and dynamic imports.
+Executes Python snippets in a restricted namespace. Blocked operations: filesystem access, `subprocess`, `socket`, dynamic imports via `__import__`. Returns `stdout`, `stderr`, and exit code. Failure modes:
 
-Failure modes:
-- malformed code
-- blocked operation
-- runtime exception
+| Failure condition | Return value |
+|---|---|
+| Blocked operation detected | `ToolResult(ok=False, error="blocked_operation")` |
+| Runtime exception | `ToolResult(ok=False, error=repr(exception))` |
+| Malformed code | `ToolResult(ok=False, error="syntax_error")` |
 
 ### SQLTool
 
-Runs read-only SQL queries against the configured database. Only `SELECT` statements are allowed.
+Runs read-only `SELECT` queries against the configured PostgreSQL database. Rejects any statement that is not a `SELECT` before execution. Failure modes:
 
-Failure modes:
-- non-SELECT query
-- malformed SQL
-- database connection failure
+| Failure condition | Return value |
+|---|---|
+| Non-SELECT statement | `ToolResult(ok=False, error="non_select_rejected")` |
+| Malformed SQL | `ToolResult(ok=False, error="sql_syntax_error")` |
+| Connection failure | `ToolResult(ok=False, error="db_connection_error")` |
 
 ### SelfReflectionTool
 
-Uses the LLM to re-read prior content and identify issues. If the LLM fails, it returns a heuristic fallback with low confidence.
+Sends prior context content to the LLM and asks it to identify inconsistencies. Returns a structured object with flagged spans and a confidence score. If the LLM call fails, returns a heuristic fallback marked with `confidence: low`.
 
-## API Endpoints
+---
 
-The application exposes the required five primary endpoints.
+## Context Budget Management
 
-### 1. Submit Query
+The `ContextManager` uses `tiktoken` to count tokens against each agent's declared budget before content is added to `SharedContext`. The check is explicit: any agent can call `check_budget(context, new_text)` to see whether adding that text would breach `max_budget`. If it would, the orchestrator invokes `CompressionAgent` before proceeding.
 
-```http
-POST /query
+Agents that bypass the budget check and cause an overflow are caught post-hoc and logged as policy violations in the trace, not silently truncated. Policy violations are queryable via `GET /trace/{job_id}`.
+
+Configuration:
+
+```
+MAX_CONTEXT_TOKENS=4096   # adjustable via environment variable
 ```
 
-Streams agent activity and final response using SSE.
+---
 
-Example:
+## Evaluation Pipeline
 
-```powershell
-Set-Content -Path .\body.json -Value '{"query":"Explain what SSE is and why this system uses it."}' -NoNewline
+The evaluation harness runs 15 test cases through the full orchestration pipeline without relying on any third-party eval framework. All scoring logic is implemented from scratch. Cases are stored in `app/eval/cases.json` and divided into three categories:
 
-curl.exe -N -X POST "http://localhost:8000/query" `
-  -H "Content-Type: application/json" `
-  --data-binary "@body.json"
+| Category | Count | Purpose |
+|---|---|---|
+| Simple (baseline) | 5 | Queries with known correct answers; establishes baseline scores |
+| Ambiguous | 5 | Underspecified inputs that test decomposition quality and assumption handling |
+| Adversarial | 5 | Prompt injections, confident wrong premises, and critique-synthesis contradiction traps |
+
+Each test case is scored across six dimensions:
+
+| Dimension | What it measures |
+|---|---|
+| Answer correctness | Coverage of expected traits in the final answer |
+| Citation accuracy | Whether retrieved chunks are cited and attributable |
+| Contradiction resolution | Whether critique-flagged contradictions are resolved in synthesis |
+| Tool selection efficiency | Penalizes unnecessary tool calls relative to query complexity |
+| Context budget compliance | Whether token limits were respected throughout the job |
+| Critique agreement rate | Whether the critique agent's confidence scores align with the final output |
+
+Every dimension produces a numeric score and a written justification string. Aggregate scores and per-case justifications are stored in the `EvaluationRun` table with the full prompt sent to each agent, every tool call made, every output received, and a timestamp. Re-running eval on the same inputs produces a diff-able result because all runs are persisted independently.
+
+---
+
+## Self-Improving Prompt Loop
+
+After each eval run, the `MetaAgent` reads all cases where `score < 0.7`, identifies the worst-performing agent-prompt combination by scoring dimension, and proposes a rewritten prompt. The proposed rewrite is stored in the `PromptVersion` table with a structured diff and a justification string. It is never automatically applied.
+
+The approval lifecycle:
+
+1. `POST /eval/re-eval` runs the harness and triggers `MetaAgent` to propose rewrites for failures.
+2. A human reviews the proposed diff via `GET /eval/summary`.
+3. `POST /prompts/approve` approves or rejects the rewrite, recording the decision with a timestamp.
+4. If approved, `POST /eval/re-eval` re-runs only the previously failed cases using the new prompt and logs the score delta.
+
+Every proposed rewrite, every approval or rejection, and every performance delta is stored with timestamps and is queryable. The full audit trail is recoverable from the `PromptVersion` table.
+
+---
+
+## Streaming and Observability
+
+Agent outputs are streamed via Server-Sent Events. The client receives typed events as the pipeline executes:
+
+| Event type | Content |
+|---|---|
+| `metadata` | Job ID and status on start |
+| `log` | Orchestrator routing decision with agent name and reasoning |
+| `agent` | Agent step output including thought, action, and result |
+| `final` | Final answer, provenance map, and job ID |
+| `error` | Machine-readable error code, human-readable message, and job ID |
+
+Structured logging uses a consistent per-event schema: timestamp, agent ID, event type, input hash, output hash, latency, token count, and policy violations if any.
+
+Retrieve the full execution trace for any job:
+
 ```
-
-### 2. Retrieve Execution Trace
-
-```http
 GET /trace/{job_id}
 ```
 
-Returns the persisted execution trace for a job.
+The trace response reconstructs the exact sequence of orchestrator routing decisions, agent steps, tool calls with retry history, compression events, and token counts in chronological order.
 
-Example:
+---
+
+## API Reference
+
+### POST /query
+
+Submit a query and receive a streaming SSE response.
+
+Request body:
+
+```json
+{ "query": "your query here" }
+```
+
+Example (Linux/macOS):
+
+```bash
+curl -N -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Explain what SSE is and why this system uses it."}'
+```
+
+Example (Windows PowerShell):
 
 ```powershell
-curl.exe http://localhost:8000/trace/YOUR_JOB_ID
+Set-Content -Path .\body.json -Value '{"query":"Explain what SSE is and why this system uses it."}' -NoNewline
+curl.exe -N -X POST "http://localhost:8000/query" -H "Content-Type: application/json" --data-binary "@body.json"
 ```
 
-### 3. Evaluation Summary
+---
 
-```http
-GET /eval/summary
+### GET /trace/{job_id}
+
+Retrieve the full execution trace for a completed job.
+
+```bash
+curl http://localhost:8000/trace/YOUR_JOB_ID
 ```
 
-Returns aggregate evaluation results stored in the database.
+---
 
-Example:
+### GET /eval/summary
 
-```powershell
-curl.exe http://localhost:8000/eval/summary
+Retrieve the latest evaluation run summary broken down by test category and scoring dimension.
+
+```bash
+curl http://localhost:8000/eval/summary
 ```
 
-### 4. Prompt Approval
+---
 
-```http
-POST /prompts/approve
+### POST /prompts/approve
+
+Submit a human approval or rejection for a pending prompt rewrite.
+
+```bash
+curl -X POST http://localhost:8000/prompts/approve \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "synthesis_agent", "prompt_text": "Always cite evidence and disclose uncertainty."}'
 ```
 
-Approves and stores a new active prompt version for an agent.
+---
 
-Example:
+### POST /eval/re-eval
 
-```powershell
-curl.exe -X POST http://localhost:8000/prompts/approve `
-  -H "Content-Type: application/json" `
-  --data-raw '{"agent_id":"synthesis_agent","prompt_text":"Always cite evidence and disclose uncertainty."}'
+Trigger evaluation on all cases (or previously failed cases if approved prompts exist) and stream results.
+
+```bash
+curl -N -X POST http://localhost:8000/eval/re-eval
 ```
 
-### 5. Re-Evaluation
+---
 
-```http
-POST /eval/re-eval
+All error responses include:
+
+```json
+{
+  "error_code": "MACHINE_READABLE_CODE",
+  "message": "Human-readable explanation.",
+  "job_id": "uuid-if-applicable"
+}
 ```
 
-Runs the evaluation harness and streams the result.
+---
 
-Example:
-
-```powershell
-curl.exe -N -X POST http://localhost:8000/eval/re-eval
-```
-
-## Setup
+## Setup and Running
 
 ### Prerequisites
 
-Install:
+Install the following:
 
-- Docker Desktop
-- uv
-- Ollama
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+- [uv](https://github.com/astral-sh/uv)
+- [Ollama](https://ollama.com)
 
-Verify:
+Verify installations:
 
-```powershell
+```bash
 docker --version
 docker compose version
 uv --version
@@ -251,207 +320,157 @@ ollama --version
 
 Pull the local model:
 
-```powershell
+```bash
 ollama pull llama3
 ```
 
-Make sure Ollama is running:
+Confirm Ollama is running:
 
-```powershell
-curl.exe http://localhost:11434/api/tags
+```bash
+curl http://localhost:11434/api/tags
 ```
 
-If Ollama is already running, `ollama serve` may show a port-in-use error. That is expected.
+If `ollama serve` reports a port-in-use error, Ollama is already running in the background. That is expected.
 
-## Running With Docker Compose
+---
+
+### Running with Docker Compose (recommended)
 
 From the project root:
 
-```powershell
+```bash
 docker compose -f docker/docker-compose.yml build --no-cache
 docker compose -f docker/docker-compose.yml up
 ```
 
-The API will be available at:
-
-```text
-http://localhost:8000
-```
+The API will be available at `http://localhost:8000`.
 
 Health check:
 
-```powershell
-curl.exe http://localhost:8000/health
+```bash
+curl http://localhost:8000/health
 ```
 
 Expected response:
 
 ```json
-{"status":"healthy","project":"Mega AI"}
+{ "status": "healthy", "project": "Mega AI" }
 ```
 
-## Running API Locally With uv
+---
 
-If Docker dependency installation fails because of network timeouts, run PostgreSQL in Docker and the API locally.
+### Running the API Locally (fallback)
 
-Start database:
+If Docker dependency installation fails due to network timeouts, run PostgreSQL in Docker and the API locally with `uv`.
 
-```powershell
+Start the database:
+
+```bash
 docker compose -f docker/docker-compose.yml up -d db
 ```
 
-Run API:
+Run the API:
 
-```powershell
+```bash
 uv sync
 uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+---
+
+### Recommended Reviewer Demo Flow
+
+1. Start Ollama and confirm `llama3` is pulled.
+2. Start the system with Docker Compose.
+3. `GET /health` — confirm the API is up.
+4. `POST /query` with a test query — note the streamed events and copy the `job_id` from the `metadata` event.
+5. `GET /trace/{job_id}` — inspect the full routing and agent decision sequence.
+6. `POST /eval/re-eval` — run all 15 evaluation cases.
+7. `GET /eval/summary` — review scores by category and dimension.
+8. `POST /prompts/approve` — approve a meta-agent-proposed prompt rewrite if one exists.
+
+---
+
 ## Environment Variables
 
-The system is configured through environment variables.
+All configuration is through environment variables. No credentials are hardcoded anywhere in the repository.
 
-Default values are in `app/core/config.py`.
+| Variable | Default | Description |
+|---|---|---|
+| `PROJECT_NAME` | `Mega AI` | Project name in API responses |
+| `DATABASE_URL` | `postgresql://user:password@localhost:5432/mega_ai` | PostgreSQL connection string |
+| `LLM_MODEL` | `llama3` | Ollama model to use |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama HTTP endpoint |
+| `MAX_CONTEXT_TOKENS` | `4096` | Per-job token budget |
 
-Important variables:
+In Docker Compose, `OLLAMA_BASE_URL` is set to `http://host.docker.internal:11434` so the API container can reach Ollama running on the host.
 
-```env
-PROJECT_NAME=Mega AI
-DATABASE_URL=postgresql://user:password@localhost:5432/mega_ai
-LLM_MODEL=llama3
-OLLAMA_BASE_URL=http://localhost:11434
-MAX_CONTEXT_TOKENS=4096
-```
+Default values are defined in `app/core/config.py`.
 
-In Docker, `OLLAMA_BASE_URL` is configured as:
+---
 
-```env
-http://host.docker.internal:11434
-```
+## Tech Stack
 
-so the API container can reach Ollama running on the host machine.
+- Python 3.12
+- FastAPI
+- SQLModel
+- PostgreSQL 15
+- Docker Compose
+- Ollama (local LLM inference)
+- httpx
+- sse-starlette
+- tiktoken
+- uv
 
-## Evaluation Harness
+---
 
-The eval harness is implemented manually without third-party evaluation frameworks.
+## Known Limitations
 
-The test set contains 15 cases:
+This is a production-oriented prototype. The following are honest assessments of where the current implementation has gaps:
 
-- 5 simple baseline queries
-- 5 ambiguous queries
-- 5 adversarial queries
+**Routing accuracy.** LLM-based routing works well for clear multi-step queries but can misroute on very short or highly ambiguous inputs. The deterministic fallback ensures the system does not hang, but the fallback path skips the decomposition DAG.
 
-Cases are stored in:
+**Search coverage.** `SearchTool` uses DuckDuckGo's public instant-answer endpoint, which returns empty results for many technical queries. The failure contract handles this explicitly, but retrieval quality is limited compared to a proper search API.
 
-```text
-app/eval/cases.json
-```
+**Tool coverage in agent paths.** `PythonTool` and `SQLTool` are fully implemented with retry and fallback contracts. In the current orchestration flow, the most common active tools are search and self-reflection. Code execution and SQL lookup are exercised primarily in adversarial and ambiguous eval cases.
 
-The harness runs the full pipeline, scores outputs, stores results in PostgreSQL, and asks the MetaAgent to propose prompt diffs for failed cases.
+**SSE granularity.** The system streams agent-level events in real time. It does not stream individual LLM tokens from Ollama, which would require tap into Ollama's streaming response endpoint and forwarding each chunk.
 
-Run:
+**Background worker.** The Docker Compose setup runs the API and PostgreSQL. A separate background worker process for long-running agent jobs is not yet extracted into its own service.
 
-```powershell
-curl.exe -N -X POST http://localhost:8000/eval/re-eval
-```
+**Prompt approval loop completeness.** The approve/reject lifecycle and per-failed-case targeted re-eval are implemented. The meta-agent's proposed diffs are stored, but the diff format is a plain text comparison rather than a structured patch object.
 
-View summary:
+**Eval scoring depth.** Scoring is deterministic and reproducible but lightweight. Citation accuracy and contradiction resolution scoring rely on keyword and structure checks rather than semantic similarity. A human-validated reference set would improve score reliability.
 
-```powershell
-curl.exe http://localhost:8000/eval/summary
-```
+**Log query UI.** The Docker Compose spec includes a log query interface as a planned service. It is not yet implemented; trace queries go through the `/trace/{job_id}` endpoint directly.
 
-## Observability
+---
 
-Every orchestration step is appended to `SharedContext.history` and persisted to the `JobExecution` table.
+## What I Would Build Next
 
-Trace data includes:
+Given additional time, the highest-value additions would be:
 
-- job ID
-- original query
-- routing decisions
-- agent thoughts
-- agent actions
-- agent outputs
-- tool results
-- token counts
-- final answer
-- provenance map
+- **Token-level SSE streaming** by consuming Ollama's streaming API and forwarding chunks with per-agent tagging.
+- **Dedicated background worker** extracted from the API process, with a job queue and status polling endpoint.
+- **Dynamic tool-selection agent** that chooses among Search, SQL, Python, and Reflection at runtime based on query classification rather than routing the choice through the main orchestrator prompt.
+- **NL-to-SQL planner** with schema introspection so SQLTool can handle natural-language queries without requiring the agent to write raw SQL.
+- **Semantic eval scoring** using embedding similarity for citation accuracy and answer correctness dimensions, replacing the current keyword-based checks.
+- **Structured prompt diff format** replacing plain text diffs with a JSON patch object that records which sentence changed, what it changed to, and the before/after score delta.
+- **Full approve/reject audit table** with a queryable history of every human decision on proposed rewrites, sorted by agent and scoring dimension.
+- **GitHub Actions CI** running compile checks, unit tests, and a Docker build on every push.
+- **Integration test suite** covering all five endpoints with both happy-path and failure-mode assertions.
 
-Retrieve trace:
-
-```powershell
-curl.exe http://localhost:8000/trace/YOUR_JOB_ID
-```
+---
 
 ## AI Collaboration Attestation
 
 AI assistance was used during development for:
 
-- scaffolding agent implementations
-- designing structured tool failure contracts
-- building the orchestration loop
-- drafting evaluation cases
-- debugging Docker, PowerShell, and SSE behavior
-- preparing project documentation
+- Scaffolding agent class structures and the shared context schema.
+- Designing structured tool failure contracts and retry interfaces.
+- Drafting and iterating on the orchestration routing loop.
+- Generating the 15 evaluation cases and expected trait definitions.
+- Debugging Docker networking, PowerShell curl behavior, and SSE event formatting.
+- Preparing and editing project documentation.
 
-All generated code was reviewed, modified, and tested locally. The final implementation choices, known limitations, and submission readiness assessment were made by the developer.
-
-## Known Limitations
-
-This is a production-oriented prototype, not a fully hardened production system.
-
-Current limitations:
-
-- The orchestrator uses LLM-based routing, but fallback guards are still conservative and may route imperfectly.
-- Search uses DuckDuckGo's public instant-answer endpoint and can return empty results for many queries.
-- Tool failures are handled explicitly, but not every tool is deeply integrated into every route yet.
-- `PythonTool` and `SQLTool` are implemented with retry/fallback contracts, but the current agent flow primarily exercises search and self-reflection.
-- Evaluation scoring is custom and reproducible, but still lightweight compared to a mature human-validated eval suite.
-- Prompt approval is implemented, but the full approve/reject lifecycle and targeted failed-case-only re-eval are simplified.
-- Docker Compose currently runs API and PostgreSQL. A separate background worker and log UI are not fully implemented.
-- SSE streams agent-level events, not true token-by-token LLM deltas.
-- Some database write failures are isolated to keep demos stable, but production observability should fail louder.
-
-## What I Would Build Next
-
-Given more time, I would add:
-
-- Dedicated background worker for long-running agent jobs
-- Tool-selection agent that chooses Search, SQL, Python, or Reflection dynamically
-- Stronger SQL natural-language-to-query planner with schema inspection
-- True token-level streaming from Ollama
-- Better citation scoring and contradiction resolution metrics
-- Prompt rewrite approval/rejection table with full audit trail
-- Targeted re-eval only on failed cases
-- Structured log query dashboard
-- More robust deterministic eval scoring
-- Integration tests for all five endpoints
-- GitHub Actions CI for compile, test, and Docker build
-
-## Demo Flow
-
-Recommended reviewer demo:
-
-1. Start Ollama and pull `llama3`
-2. Start the system with Docker Compose
-3. Check `/health`
-4. Send a query to `/query`
-5. Copy the streamed `job_id`
-6. Retrieve `/trace/{job_id}`
-7. Run `/eval/re-eval`
-8. Retrieve `/eval/summary`
-
-Example query:
-
-```powershell
-Set-Content -Path .\body.json -Value '{"query":"Explain what SSE is and why this system uses it."}' -NoNewline
-
-curl.exe -N -X POST "http://localhost:8000/query" `
-  -H "Content-Type: application/json" `
-  --data-binary "@body.json"
-```
-
-
-This project was created as a take-home assessment submission.
-```
+All generated code was reviewed, understood, and tested locally before inclusion. Architecture decisions, known-limitation assessments, and submission readiness judgments were made by the developer.
