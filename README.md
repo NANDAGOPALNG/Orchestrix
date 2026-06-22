@@ -1,8 +1,10 @@
-# Mega AI
+
+
+# Orchestrix
 
 **Real-Time Multi-Agent LLM Orchestration and Evaluation System**
 
-Mega AI is a containerized, local-first multi-agent system built with FastAPI, PostgreSQL, SQLModel, Server-Sent Events, and Ollama. It implements dynamic LLM-based routing, a shared-context inter-agent communication schema, structured tool failure handling, context budget enforcement, and a fully custom evaluation harness with a self-improving prompt loop.
+Orchestrix is a containerized, local-first multi-agent system built with FastAPI, PostgreSQL, SQLModel, Server-Sent Events, and Ollama. It implements dynamic LLM-based routing, a shared-context inter-agent communication schema, structured tool failure handling, context budget enforcement, and a fully custom evaluation harness with a self-improving prompt loop.
 
 ---
 
@@ -32,6 +34,7 @@ Mega AI is a containerized, local-first multi-agent system built with FastAPI, P
 All inter-agent communication flows exclusively through a typed `SharedContext` object. Agents do not call one another. The orchestrator mediates every handoff and logs its routing rationale before each step.
 
 ---
+
 
 ## Agents
 
@@ -319,6 +322,128 @@ curl http://localhost:8000/health
 ```
 
 Expected response:
+
+```json
+{ "status": "healthy", "project": "Orchestrix" }
+```
+
+---
+
+### Running the API Locally (fallback)
+
+If Docker dependency installation fails due to network timeouts, run PostgreSQL in Docker and the API locally with `uv`.
+
+Start the database:
+
+```bash
+docker compose -f docker/docker-compose.yml up -d db
+```
+
+Run the API:
+
+```bash
+uv sync
+uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+---
+
+### Recommended Reviewer Demo Flow
+
+1. Start Ollama and confirm `llama3` is pulled.
+2. Start the system with Docker Compose.
+3. `GET /health` — confirm the API is up.
+4. `POST /query` with a test query — note the streamed events and copy the `job_id` from the `metadata` event.
+5. `GET /trace/{job_id}` — inspect the full routing and agent decision sequence.
+6. `POST /eval/re-eval` — run all 15 evaluation cases.
+7. `GET /eval/summary` — review scores by category and dimension.
+8. `POST /prompts/approve` — approve a meta-agent-proposed prompt rewrite if one exists.
+
+---
+
+## Environment Variables
+
+All configuration is through environment variables. No credentials are hardcoded anywhere in the repository.
+
+| Variable | Default | Description |
+|---|---|---|
+| `PROJECT_NAME` | `Orchestrix` | Project name in API responses |
+| `DATABASE_URL` | `postgresql://user:password@localhost:5432/orchestrix` | PostgreSQL connection string |
+| `LLM_MODEL` | `llama3` | Ollama model to use |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama HTTP endpoint |
+| `MAX_CONTEXT_TOKENS` | `4096` | Per-job token budget |
+
+In Docker Compose, `OLLAMA_BASE_URL` is set to `http://host.docker.internal:11434` so the API container can reach Ollama running on the host.
+
+Default values are defined in `app/core/config.py`.
+
+---
+
+## Tech Stack
+
+- Python 3.12
+- FastAPI
+- SQLModel
+- PostgreSQL 15
+- Docker Compose
+- Ollama (local LLM inference)
+- httpx
+- sse-starlette
+- tiktoken
+- uv
+
+---
+
+## Known Limitations
+
+This is a production-oriented prototype. The following are honest assessments of where the current implementation has gaps:
+
+**Routing accuracy.** LLM-based routing works well for clear multi-step queries but can misroute on very short or highly ambiguous inputs. The deterministic fallback ensures the system does not hang, but the fallback path skips the decomposition DAG.
+
+**Search coverage.** `SearchTool` uses DuckDuckGo's public instant-answer endpoint, which returns empty results for many technical queries. The failure contract handles this explicitly, but retrieval quality is limited compared to a proper search API.
+
+**Tool coverage in agent paths.** `PythonTool` and `SQLTool` are fully implemented with retry and fallback contracts. In the current orchestration flow, the most common active tools are search and self-reflection. Code execution and SQL lookup are exercised primarily in adversarial and ambiguous eval cases.
+
+**SSE granularity.** The system streams agent-level events in real time. It does not stream individual LLM tokens from Ollama, which would require tapping into Ollama's streaming response endpoint and forwarding each chunk.
+
+**Background worker.** The Docker Compose setup runs the API and PostgreSQL. A separate background worker process for long-running agent jobs is not yet extracted into its own service.
+
+**Prompt approval loop completeness.** The approve/reject lifecycle and per-failed-case targeted re-eval are implemented. The meta-agent's proposed diffs are stored, but the diff format is a plain text comparison rather than a structured patch object.
+
+**Eval scoring depth.** Scoring is deterministic and reproducible but lightweight. Citation accuracy and contradiction resolution scoring rely on keyword and structure checks rather than semantic similarity. A human-validated reference set would improve score reliability.
+
+**Log query UI.** The Docker Compose spec includes a log query interface as a planned service. It is not yet implemented; trace queries go through the `/trace/{job_id}` endpoint directly.
+
+---
+
+## What I Would Build Next
+
+Given additional time, the highest-value additions would be:
+
+- **Token-level SSE streaming** by consuming Ollama's streaming API and forwarding chunks with per-agent tagging.
+- **Dedicated background worker** extracted from the API process, with a job queue and status polling endpoint.
+- **Dynamic tool-selection agent** that chooses among Search, SQL, Python, and Reflection at runtime based on query classification rather than routing the choice through the main orchestrator prompt.
+- **NL-to-SQL planner** with schema introspection so SQLTool can handle natural-language queries without requiring the agent to write raw SQL.
+- **Semantic eval scoring** using embedding similarity for citation accuracy and answer correctness dimensions, replacing the current keyword-based checks.
+- **Structured prompt diff format** replacing plain text diffs with a JSON patch object that records which sentence changed, what it changed to, and the before/after score delta.
+- **Full approve/reject audit table** with a queryable history of every human decision on proposed rewrites, sorted by agent and scoring dimension.
+- **GitHub Actions CI** running compile checks, unit tests, and a Docker build on every push.
+- **Integration test suite** covering all five endpoints with both happy-path and failure-mode assertions.
+
+---
+
+## AI Collaboration Attestation
+
+AI assistance was used during development for:
+
+- Scaffolding agent class structures and the shared context schema.
+- Designing structured tool failure contracts and retry interfaces.
+- Drafting and iterating on the orchestration routing loop.
+- Generating the 15 evaluation cases and expected trait definitions.
+- Debugging Docker networking, PowerShell curl behavior, and SSE event formatting.
+- Preparing and editing project documentation.
+
+All generated code was reviewed, understood, and tested locally before inclusion. Architecture decisions, known-limitation assessments, and submission readiness judgments were made by the developer.
 
 ```json
 { "status": "healthy", "project": "Mega AI" }
